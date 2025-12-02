@@ -1,7 +1,7 @@
 # chitra_app.py
 #
 # Streamlit UI for ChitraAdvisor – cleaner, mobile-friendly.
-
+import os
 import streamlit as st
 
 from chitra_core import (
