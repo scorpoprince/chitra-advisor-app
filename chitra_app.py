@@ -10,6 +10,10 @@ from chitra_core import (
     analyze_single_stock,
     build_portfolio,
 )
+# Bridge Streamlit secrets → environment variable for OpenAI
+if "OPENAI_API_KEY" in st.secrets:
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+
 
 st.set_page_config(
     page_title="ChitraAdvisor – Stock Helper",
