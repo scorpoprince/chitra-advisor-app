@@ -1,21 +1,20 @@
 """
 Streamlit front-end for ChitraAdvisor – Stock Helper (Safety ON)
 
-This file assumes:
-- chitra_core.py is in the same folder.
-- OPENAI_API_KEY is provided via Streamlit secrets.
+This UI uses the refactored `backend` package for all core logic.  The
+OpenAI API key must still be provided via Streamlit secrets under the
+`OPENAI_API_KEY` key.
 """
 
 import os
 
 import streamlit as st
 
-from chitra_core import (
-    analyze_single_stock,
-    build_portfolio,
-    UNIVERSES,
-    RISK_LEVELS,
-)
+# Import the refactored backend modules.  The functions and constants live
+# under the `backend` package instead of the monolithic chitra_core.py.
+from backend.single_stock import analyze_single_stock
+from backend.portfolio import build_portfolio
+from backend.models import UNIVERSES, RISK_LEVELS, RISK_TO_POSITIONS
 
 # Bridge Streamlit secrets -> environment for OpenAI client
 if "OPENAI_API_KEY" in st.secrets:
