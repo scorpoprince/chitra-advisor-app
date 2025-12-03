@@ -13,6 +13,7 @@ import time
 import os
 from functools import lru_cache
 from typing import List, Dict, Tuple
+import logging
 
 import requests
 import numpy as np
@@ -21,18 +22,35 @@ import yfinance as yf
 import streamlit as st
 from openai import OpenAI
 
+# -----------------------------------------------------------------------------
+# Logging setup
+# -----------------------------------------------------------------------------
+logger = logging.getLogger("chitra_core")
+if not logger.handlers:
+    # Streamlit attaches handlers already; we just set a sensible level
+    logger.setLevel(logging.INFO)
+
 # ============ OpenAI client & helpers ============
 
 client = OpenAI()
 
-# ==== FMP API key – force from Streamlit secrets ====
+# ==== FMP API key – force from Streamlit secrets ONLY ====
 try:
     FMP_API_KEY = st.secrets["FMP_API_KEY"].strip()
 except Exception:
     FMP_API_KEY = ""
 
-print("[DEBUG] FMP key present:", bool(FMP_API_KEY))
-# ====================================================
+logger.info("FMP key present: %s (len=%d)", bool(FMP_API_KEY), len(FMP_API_KEY))
+
+# ============ Symbol helpers & price cache ============
+
+# Very small in-memory cache for AI-resolved symbols
+_SYMBOL_RESOLUTION_CACHE: Dict[str, str] = {}
+
+# symbol -> (timestamp, price)
+_PRICE_CACHE: Dict[str, Tuple[float, float]] = {}
+_PRICE_TTL_SEC = 300  # 5 minutes
+
 
 def _safe_chat(
     system_prompt: str,
@@ -82,29 +100,9 @@ def _safe_chat(
     raise RuntimeError(f"OpenAI call failed: {last_err}")
 
 
-# ============ Symbol helpers & price cache ============
-
-# Very small in-memory cache for AI-resolved symbols
-_SYMBOL_RESOLUTION_CACHE: Dict[str, str] = {}
-
-# FMP config & simple price cache
-#FMP_API_KEY = os.getenv("FMP_API_KEY", "").strip()
-#if not FMP_API_KEY:
-    # Fallback to Streamlit secrets if env var is not set
- #   try:
-  #      FMP_API_KEY = str(st.secrets.get("FMP_API_KEY", "")).strip()
-   # except Exception:
-    #    FMP_API_KEY = ""
-
-print("[DEBUG] FMP key length:", len(FMP_API_KEY))  # will show up in Streamlit logs
-# symbol -> (timestamp, price)
-_PRICE_CACHE: Dict[str, Tuple[float, float]] = {}
-_PRICE_TTL_SEC = 300  # 5 minutes
-
-
 def normalize_symbol(user_input: str) -> str:
     """
-    Try to turn whatever user typed into a usable NSE symbol.
+    Turn user input into a usable NSE symbol.
 
     Rules:
     - Trim spaces, uppercase.
@@ -181,10 +179,9 @@ def _download_history(symbol: str, period: str = "1y", interval: str = "1d") -> 
     raise RuntimeError(f"Could not download data for {symbol}: {last_err}")
 
 
-# symbol -> (timestamp, price)
-_PRICE_CACHE: Dict[str, Tuple[float, float]] = {}
-_PRICE_TTL_SEC = 300  # 5 minutes
-
+# -----------------------------------------------------------------------------
+# Price fetchers: FMP primary, yfinance fallback
+# -----------------------------------------------------------------------------
 
 def _get_price_from_fmp(symbol: str) -> float:
     """
@@ -195,7 +192,7 @@ def _get_price_from_fmp(symbol: str) -> float:
         raise RuntimeError("FMP_API_KEY is not set in Streamlit secrets.")
 
     url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={FMP_API_KEY}"
-    print(f"[DEBUG] Calling FMP for {symbol}")  # <-- will show in logs
+    logger.info("Calling FMP for %s", symbol)
 
     resp = requests.get(url, timeout=5)
 
@@ -222,7 +219,7 @@ def _get_price_from_yf(symbol: str) -> float:
     """
     Fallback price using yfinance (last close from 5 days).
     """
-    print(f"[DEBUG] Falling back to yfinance for {symbol}")
+    logger.warning("Falling back to yfinance for %s", symbol)
     df = _download_history(symbol, period="5d", interval="1d")
     latest_close = float(df["Close"].iloc[-1])
     return round(latest_close, 2)
@@ -248,12 +245,11 @@ def get_latest_price(symbol: str) -> float:
     try:
         price = _get_price_from_fmp(symbol)
     except Exception as exc:
-        print(f"[WARN] FMP price fetch failed for {symbol}: {exc}")
+        logger.warning("FMP price fetch failed for %s: %s", symbol, exc)
         price = _get_price_from_yf(symbol)
 
     _PRICE_CACHE[symbol] = (now, price)
     return price
-
 
 
 def get_basic_technicals(symbol: str) -> Dict:
@@ -544,7 +540,7 @@ def build_portfolio(
             price_map[sym] = get_latest_price(sym)
         except Exception as exc:
             skipped_symbols.append(sym)
-            print(f"[WARN] Skipping {sym} – price fetch failed: {exc}")
+            logger.warning("Skipping %s – price fetch failed: %s", sym, exc)
 
     if not price_map:
         # Everything failed – bail out cleanly
@@ -580,6 +576,6 @@ def build_portfolio(
     unallocated_cash = round(unallocated_cash, 2)
 
     if skipped_symbols:
-        print(f"[INFO] Portfolio built, but skipped symbols: {', '.join(skipped_symbols)}")
+        logger.info("Portfolio built, but skipped symbols: %s", ", ".join(skipped_symbols))
 
     return df, unallocated_cash
