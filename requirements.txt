@@ -1,8 +1,7 @@
-streamlit==1.51.0
-openai>=1.12.0
-yfinance==0.2.66
-pandas==2.2.1
-requests>=2.31.0
-numpy>=1.26.0
+streamlit
+openai
+yfinance
+pandas
+requests
+numpy
 pytz
-pytest
