@@ -1,457 +1,446 @@
-# chitra_core.py
+"""
+Core logic for ChitraAdvisor – Stock Helper
+
+- Handles symbol normalisation (".NS" auto-handling)
+- Fetches prices with caching + retry
+- Single–stock idea via OpenAI
+- Portfolio suggestion (universe + risk based)
+"""
+
+import json
 import math
 import time
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+from functools import lru_cache
+from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from openai import OpenAI, RateLimitError, APIError
+from openai import OpenAI
+
+# ============ OpenAI client & helpers ============
 
 client = OpenAI()
 
-
-# ---------- Helper: safe OpenAI call with retries ----------
-
-def safe_openai_chat(model: str, messages: List[Dict], max_tokens: int = 900):
-    """
-    Wraps OpenAI chat call with small retry / backoff.
-    Avoids hard crashes on transient rate limits.
-    """
-    backoff_seconds = [1, 2, 4]  # three attempts
-    last_error = None
-
-    for delay in backoff_seconds:
+def _safe_chat(
+    system_prompt: str,
+    user_prompt: str,
+    model: str = "gpt-4.1-mini",
+    max_tokens: int = 900,
+    temperature: float = 0.4,
+) -> str:
+    """Small wrapper with basic retry & friendly errors."""
+    last_err = None
+    for attempt in range(3):
         try:
             resp = client.chat.completions.create(
                 model=model,
-                messages=messages,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature,
                 max_tokens=max_tokens,
-                temperature=0.6,
             )
             return resp.choices[0].message.content.strip()
-        except RateLimitError as e:
-            last_error = e
-            time.sleep(delay)
-        except APIError as e:
-            last_error = e
-            time.sleep(delay)
+        except Exception as exc:  # broad, we don't want the app to crash
+            last_err = exc
+            msg = str(exc).lower()
+            # crude rate-limit / transient error detection
+            if "rate" in msg or "timeout" in msg or "overloaded" in msg:
+                sleep_for = 2 ** attempt
+                time.sleep(sleep_for)
+                continue
+            break
+    raise RuntimeError(f"OpenAI call failed: {last_err}")
 
-    # If we are here, all retries failed
-    raise last_error
+# ============ Symbol helpers & price cache ============
+
+# Very small in-memory cache for AI-resolved symbols
+_SYMBOL_RESOLUTION_CACHE: Dict[str, str] = {}
 
 
-# ---------- Market data & technicals ----------
-
-def fetch_history(
-    ticker: str, period: str = "1y", interval: str = "1d"
-) -> pd.DataFrame:
+def normalize_symbol(user_input: str) -> str:
     """
-    Fetch OHLCV data from Yahoo Finance.
-    Ensures we always return a clean DataFrame, or raise if no data.
+    Try to turn whatever user typed into a usable NSE symbol.
+
+    Rules:
+    - Trim spaces, uppercase.
+    - If it already ends with ".NS" or any ".XYZ", keep as-is.
+    - If no dot, assume NSE and append ".NS".
     """
-    data = yf.download(
-        ticker,
-        period=period,
-        interval=interval,
-        auto_adjust=True,
-        progress=False,
-        threads=False,
+    raw = (user_input or "").strip()
+    if not raw:
+        raise ValueError("Please enter a company name or symbol.")
+
+    s_up = raw.upper()
+    if "." in s_up:
+        return s_up
+    # Plain symbol like "TCS" -> "TCS.NS"
+    return s_up + ".NS"
+
+
+def _maybe_resolve_company_name_with_ai(user_input: str, model: str) -> str:
+    """
+    If user typed a long name like 'Maruti Suzuki India Limited',
+    ask the model for the closest NSE symbol once and cache it.
+    """
+    key = user_input.strip().lower()
+    if key in _SYMBOL_RESOLUTION_CACHE:
+        return _SYMBOL_RESOLUTION_CACHE[key]
+
+    system = (
+        "You are an assistant that maps Indian stock names/descriptions to NSE symbols. "
+        "Always return ONLY the NSE symbol like 'MARUTI.NS'. "
+        "If you are not sure, return the word UNKNOWN."
     )
+    user = (
+        f"User typed: '{user_input}'.\n"
+        "What is the most likely NSE symbol? Reply with only the symbol or UNKNOWN."
+    )
+    try:
+        ans = _safe_chat(system, user, model=model, max_tokens=20)
+    except Exception:
+        return "UNKNOWN"
 
-    if data is None or data.empty:
-        raise ValueError(f"No price data found for ticker '{ticker}'")
+    sym = ans.strip().upper()
+    if "UNKNOWN" in sym:
+        sym = "UNKNOWN"
 
-    # Standardise columns
-    data = data[["Open", "High", "Low", "Close", "Volume"]].dropna()
-    return data
-
-
-def compute_rsi(series: pd.Series, window: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    _SYMBOL_RESOLUTION_CACHE[key] = sym
+    return sym
 
 
-def technical_snapshot(
-    ticker: str, holding_days: int = 90
-) -> Dict:
+@lru_cache(maxsize=256)
+def _download_history(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
     """
-    Returns a compact technical snapshot used by the AI.
-    Everything is converted to Python floats (no numpy arrays / Series).
-    """
-    df = fetch_history(ticker, period="1y", interval="1d")
-    closes = df["Close"]
-    volumes = df["Volume"]
+    Download price history with retry & small cache.
 
-    # Basic stats
-    latest_close = float(closes.iloc[-1])
+    We purposely keep this independent from Streamlit,
+    so it also works in local CLI tests.
+    """
+    last_err = None
+    for attempt in range(3):
+        try:
+            df = yf.download(
+                symbol,
+                period=period,
+                interval=interval,
+                progress=False,
+                auto_adjust=False,
+                threads=True,
+            )
+            if df is None or df.empty:
+                raise RuntimeError(f"No price data found for symbol {symbol}")
+            return df
+        except Exception as exc:
+            last_err = exc
+            time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"Could not download data for {symbol}: {last_err}")
+
+
+def get_latest_price(symbol: str) -> float:
+    df = _download_history(symbol, period="5d", interval="1d")
+    latest_close = float(df["Close"].iloc[-1])
+    return round(latest_close, 2)
+
+
+def get_basic_technicals(symbol: str) -> Dict:
+    """
+    Compute a handful of simple technical stats.
+    Enough to give the model some structure,
+    but still cheap & fast.
+    """
+    df = _download_history(symbol, period="1y", interval="1d")
+    closes = df["Close"].astype(float)
+
+    daily_returns = closes.pct_change().dropna()
+    if daily_returns.empty:
+        vol_annual = 0.0
+    else:
+        vol_annual = float(daily_returns.std() * math.sqrt(252))
+
     ma50 = float(closes.rolling(50).mean().iloc[-1])
     ma200 = float(closes.rolling(200).mean().iloc[-1])
 
-    daily_returns = closes.pct_change().dropna()
-    vol_annual = float(daily_returns.std() * math.sqrt(252))
+    # simple RSI(14)
+    delta = closes.diff()
+    up = delta.clip(lower=0).rolling(14).mean()
+    down = -delta.clip(upper=0).rolling(14).mean()
+    rs = up / (down + 1e-9)
+    rsi14 = 100 - (100 / (1 + rs))
+    rsi_val = float(rsi14.iloc[-1])
 
-    # RSI
-    rsi14 = compute_rsi(closes, 14)
-    latest_rsi = float(rsi14.iloc[-1]) if not math.isnan(rsi14.iloc[-1]) else 50.0
+    start_price = float(closes.iloc[0])
+    last_price = float(closes.iloc[-1])
+    one_year_return_pct = ((last_price / start_price) - 1.0) * 100
 
-    # Volume trend
-    vol50 = float(volumes.rolling(50).mean().iloc[-1])
-    latest_vol = float(volumes.iloc[-1])
-    volume_ratio = latest_vol / vol50 if vol50 > 0 else 1.0
-
-    # Recent support / resistance
-    lookback = min(60, len(closes))
-    recent = closes.iloc[-lookback:]
-
+    recent = closes.tail(60)
     support = float(recent.min())
     resistance = float(recent.max())
     pivot = float(recent.iloc[-1])
 
-    # Very simple “trend strength” number between 0–1
-    trend_score = 0.0
-    if ma50 > ma200 and latest_close > ma50:
-        trend_score = 1.0
-    elif latest_close > ma50:
-        trend_score = 0.7
-    elif latest_close > ma200:
-        trend_score = 0.4
-
     return {
-        "ticker": ticker.upper(),
-        "latest_close": round(latest_close, 2),
+        "symbol": symbol,
+        "last_close": round(last_price, 2),
         "ma50": round(ma50, 2),
         "ma200": round(ma200, 2),
         "vol_annual": round(vol_annual, 4),
-        "rsi14": round(latest_rsi, 2),
-        "volume_ratio": round(volume_ratio, 2),
+        "rsi14": round(rsi_val, 2),
+        "one_year_return_pct": round(one_year_return_pct, 2),
         "support": round(support, 2),
         "resistance": round(resistance, 2),
         "pivot": round(pivot, 2),
-        "trend_score": round(trend_score, 2),
-        "holding_days": holding_days,
     }
 
 
-# ---------- AI layer: single stock idea ----------
+# ============ Single stock analysis ============
 
-RISK_TEXT = {
-    "Low": "very conservative; prefers mega / large caps, 5–10% per stock, hates drawdowns.",
-    "Medium": "balanced; comfortable with 10–15% per stock, accepts normal volatility.",
-    "High": "aggressive; okay with 15–20% per stock and deeper but temporary drawdowns.",
-    "All or Nothing": "extremely aggressive; can concentrate 30–50% into a single idea.",
-}
-
-
-def build_single_stock_messages(
-    metrics: Dict,
+def analyze_single_stock(
+    user_typed: str,
     capital: float,
     risk_profile: str,
-    language: str,
-) -> List[Dict]:
-    """
-    Builds the system + user messages for the AI.
-    We keep it to ONE call per stock idea.
-    """
-    lang = "Hindi" if language.lower().startswith("hi") else "English"
-
-    system_msg = {
-        "role": "system",
-        "content": (
-            "You are ChitraAdvisor, a calm, risk-aware stock guide for an Indian retail investor. "
-            "You MUST NOT give direct financial advice, and you MUST remind that this is educational only. "
-            "Use simple, clear language. Assume the person is not a trader."
-        ),
-    }
-
-    user_msg = {
-        "role": "user",
-        "content": f"""
-We are analysing an Indian stock.
-
-Technical snapshot (NSE):
-- Ticker: {metrics['ticker']}
-- Last close: ₹{metrics['latest_close']}
-- 50DMA: ₹{metrics['ma50']}
-- 200DMA: ₹{metrics['ma200']}
-- Annualised volatility: {metrics['vol_annual']:.4f}
-- RSI(14): {metrics['rsi14']}
-- Volume vs 50-day avg: {metrics['volume_ratio']}x
-- Support: ₹{metrics['support']}
-- Resistance: ₹{metrics['resistance']}
-- Pivot region: ₹{metrics['pivot']}
-- Trend strength (0–1): {metrics['trend_score']}
-
-Investor context:
-- Capital considered for this idea: ₹{capital:,.0f}
-- Intended holding period: ~{metrics['holding_days']} days
-- Risk profile: {risk_profile} ({RISK_TEXT.get(risk_profile, '')})
-- Output language: {lang}
-
-TASK:
-
-1. First line MUST be exactly in this format (UPPERCASE rating):
-   RATING: BUY
-   or
-   RATING: HOLD
-   or
-   RATING: SELL
-   or
-   RATING: AVOID
-
-   - BUY = reasonable to slowly accumulate with discipline.
-   - HOLD = okay to keep if already owning, but fresh buying should be cautious.
-   - SELL = suitable to exit or reduce.
-   - AVOID = do NOT touch for this risk profile.
-
-2. After that, give a short explanation in bullet points covering:
-   - Trend & momentum (mention 50/200DMA and RSI)
-   - Risk level / volatility in plain language
-   - Suggested entry zone (around which price range), stop-loss region, and rough upside zone
-   - How much maximum % of total portfolio this stock could be for THIS risk profile
-   - A one-line 'Plan' (e.g. 'staggered buying near support over 3–4 weeks').
-
-3. End with a final line:
-   NOTE: This is not investment advice, only an educational model output.
-
-Write the whole answer in {lang}. Keep it compact and friendly.
-""",
-    }
-
-    return [system_msg, user_msg]
-
-
-def analyse_single_stock(
-    ticker: str,
-    capital: float,
-    holding_days: int,
-    risk_profile: str,
-    language: str,
-    model_name: str,
+    holding_period_days: int,
+    language: str = "en",
+    model: str = "gpt-4.1-mini",
 ) -> Dict:
     """
-    Main entry used by Streamlit's cached function.
-    Returns dict: { 'metrics': {...}, 'rating': 'BUY', 'explanation': '...' }
+    Main entry point for the Single Stock tab.
+
+    Returns dict with:
+      - resolved_symbol
+      - display_symbol
+      - metrics
+      - analysis_markdown
     """
-    metrics = technical_snapshot(ticker, holding_days=holding_days)
-    messages = build_single_stock_messages(
-        metrics, capital, risk_profile, language
+    if not user_typed or not user_typed.strip():
+        raise ValueError("Please enter a company name or NSE symbol.")
+
+    text = user_typed.strip()
+    symbol_guess = normalize_symbol(text)
+
+    # First try the naive guess
+    try:
+        metrics = get_basic_technicals(symbol_guess)
+        resolved_symbol = symbol_guess
+    except Exception:
+        # If the input looks like a long name, try AI symbol resolution once
+        if " " in text.strip():
+            ai_symbol = _maybe_resolve_company_name_with_ai(text, model=model)
+            if ai_symbol != "UNKNOWN":
+                metrics = get_basic_technicals(ai_symbol)
+                resolved_symbol = ai_symbol
+            else:
+                raise RuntimeError(
+                    "Could not find price data for what you typed. "
+                    "Please try again using the NSE symbol, e.g. 'TCS' or 'TCS.NS'."
+                )
+        else:
+            raise
+
+    # Build prompt for the model
+    risk_text = {
+        "Low": "very conservative, capital preservation focused",
+        "Medium": "balanced risk and return",
+        "High": "aggressive, willing to take drawdowns for higher return",
+        "All or Nothing": "extremely aggressive, okay with large loss if thesis fails",
+    }.get(risk_profile, "balanced risk and return")
+
+    lang_label = "English" if language == "en" else "Hindi"
+
+    system_prompt = (
+        "You are ChitraAdvisor, a friendly Indian stock helper for a retail investor. "
+        "You DO NOT give guaranteed advice – only model-based, educational views.\n\n"
+        "You must always respect risk profile and give clear levels (entry, stop, targets). "
+        "Assume Indian equity market, delivery trades (no intraday leverage). "
     )
-    text = safe_openai_chat(model_name, messages)
 
-    # Parse first line "RATING: X"
-    rating = "UNKNOWN"
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if lines and lines[0].upper().startswith("RATING:"):
-        rating = lines[0].split(":", 1)[1].strip().upper()
+    user_prompt = f"""
+User wants a single stock idea.
 
-    explanation = "\n".join(lines[1:]).strip()
+Symbol: {resolved_symbol}
+Total capital user is considering for THIS idea (not full portfolio): ₹{capital:,.0f}
+Risk profile: {risk_profile} ({risk_text})
+Intended holding period: ~{holding_period_days} days
+Language for explanation: {lang_label}
+
+Recent technical snapshot (approx):
+- Last close: ₹{metrics['last_close']}
+- 50-day MA: ₹{metrics['ma50']}
+- 200-day MA: ₹{metrics['ma200']}
+- 1-year return: {metrics['one_year_return_pct']}%
+- Annualised volatility: {metrics['vol_annual']}
+- RSI(14): {metrics['rsi14']}
+- Support: ₹{metrics['support']}
+- Resistance: ₹{metrics['resistance']}
+- Pivot / reference level: ₹{metrics['pivot']}
+
+TASK:
+1. Decide a clear ACTION among:
+   BUY, AVOID, HOLD, PARTIAL EXIT, or SELL.
+2. Suggest:
+   - Ideal entry zone (one price or a narrow range)
+   - Stop loss level
+   - 1–2 target levels
+   - How much of the user's capital is reasonable to allocate (as % of capital)
+   - Short comment on expected volatility and risk.
+3. Explain the reasoning in simple {lang_label}, in 5–8 bullet points max.
+4. Tone: calm, realistic, no hype. Reiterate that this is NOT guaranteed advice.
+
+FORMAT (very important) – answer EXACTLY in this markdown layout:
+
+Action: <one of BUY / AVOID / HOLD / PARTIAL EXIT / SELL>
+
+Entry zone: ₹<x> – ₹<y>  (or just one price)
+Stop loss: ₹<z>
+Targets: ₹<t1> (and ₹<t2> if you want)
+Suggested allocation: <p>% of the capital for this idea
+
+Holding view:
+<one short sentence about time horizon & conditions to re-evaluate>
+
+Reasoning:
+- point 1
+- point 2
+- ...
+- point N
+
+Risk reminder:
+<one short line reminding this is educational only>
+"""
+
+    analysis_markdown = _safe_chat(system_prompt, user_prompt, model=model, max_tokens=700)
 
     return {
+        "resolved_symbol": resolved_symbol,
+        "display_symbol": resolved_symbol,
         "metrics": metrics,
-        "rating": rating,
-        "explanation": explanation,
+        "analysis_markdown": analysis_markdown,
     }
 
 
-# ---------- Portfolio suggestion helpers (no OpenAI) ----------
+# ============ Portfolio suggestion ============
 
-# Basic universes – simplified examples, just to have stable tickers.
+# Very rough universes – enough for experimentation.
 UNIVERSES: Dict[str, List[str]] = {
     "NIFTY50": [
-        "RELIANCE.NS",
-        "TCS.NS",
-        "INFY.NS",
-        "HDFCBANK.NS",
-        "ICICIBANK.NS",
-        "KOTAKBANK.NS",
-        "AXISBANK.NS",
-        "SBIN.NS",
-        "ITC.NS",
-        "LT.NS",
-        "HINDUNILVR.NS",
-        "ASIANPAINT.NS",
-        "BAJFINANCE.NS",
-        "SUNPHARMA.NS",
-        "MARUTI.NS",
-        "ULTRACEMCO.NS",
+        "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS",
+        "INFY.NS", "TCS.NS", "ITC.NS", "LT.NS", "AXISBANK.NS",
+        "KOTAKBANK.NS", "HINDUNILVR.NS", "BAJFINANCE.NS",
+        "ASIANPAINT.NS", "MARUTI.NS", "SUNPHARMA.NS",
+        "TITAN.NS", "ULTRACEMCO.NS", "HCLTECH.NS", "WIPRO.NS",
         "NESTLEIND.NS",
-        "HCLTECH.NS",
-        "POWERGRID.NS",
-        "TITAN.NS",
     ],
     "NIFTY100": [
-        "RELIANCE.NS",
-        "TCS.NS",
-        "INFY.NS",
-        "HDFCBANK.NS",
-        "ICICIBANK.NS",
-        "KOTAKBANK.NS",
-        "AXISBANK.NS",
-        "SBIN.NS",
-        "ITC.NS",
-        "LT.NS",
-        "HINDUNILVR.NS",
-        "ASIANPAINT.NS",
-        "BAJFINANCE.NS",
-        "SUNPHARMA.NS",
-        "MARUTI.NS",
-        "ULTRACEMCO.NS",
-        "NESTLEIND.NS",
-        "HCLTECH.NS",
-        "POWERGRID.NS",
-        "TITAN.NS",
-        "TECHM.NS",
-        "JSWSTEEL.NS",
-        "ONGC.NS",
-        "COALINDIA.NS",
-        "BAJAJFINSV.NS",
-        "ADANIPORTS.NS",
-        "ADANIENT.NS",
-        "CIPLA.NS",
-        "DRREDDY.NS",
+        "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS",
+        "INFY.NS", "TCS.NS", "ITC.NS", "LT.NS", "AXISBANK.NS",
+        "KOTAKBANK.NS", "HINDUNILVR.NS", "BAJFINANCE.NS",
+        "ASIANPAINT.NS", "MARUTI.NS", "SUNPHARMA.NS",
+        "TITAN.NS", "ULTRACEMCO.NS", "HCLTECH.NS", "WIPRO.NS",
+        "NESTLEIND.NS", "DMART.NS", "PIDILITIND.NS", "DIVISLAB.NS",
     ],
-    "NIFTYNEXT50": [
-        "BEL.NS",
-        "DABUR.NS",
-        "GAIL.NS",
-        "PIDILITIND.NS",
-        "ICICIGI.NS",
-        "ICICIPRULI.NS",
-        "BANKBARODA.NS",
-        "INDUSINDBK.NS",
-        "SRF.NS",
-        "NAUKRI.NS",
-        "MUTHOOTFIN.NS",
-        "PEL.NS",
-        "UBL.NS",
-        "HAVELLS.NS",
-        "CHOLAFIN.NS",
-        "DIVISLAB.NS",
-        "LUPIN.NS",
-        "AUROPHARMA.NS",
-        "BERGEPAINT.NS",
-        "COLPAL.NS",
+    "NIFTY_NEXT_50": [
+        "DMART.NS", "ICICIPRULI.NS", "DIVISLAB.NS", "BERGEPAINT.NS",
+        "DABUR.NS", "GODREJCP.NS", "PGHH.NS", "UNITDSPR.NS",
+        "BAJAJHLDNG.NS", "BANKBARODA.NS", "HINDPETRO.NS",
+        "INDHOTEL.NS", "LUPIN.NS", "MFSL.NS", "SIEMENS.NS",
     ],
-    "NIFTY200": [],  # we can treat as NIFTY100 universe in app if needed
+    "NIFTY200": [
+        "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS",
+        "INFY.NS", "TCS.NS", "ITC.NS", "LT.NS", "AXISBANK.NS",
+        "KOTAKBANK.NS", "BAJFINANCE.NS", "ASIANPAINT.NS",
+        "MARUTI.NS", "SUNPHARMA.NS", "DMART.NS", "PIDILITIND.NS",
+        "DIVISLAB.NS", "LUPIN.NS", "SIEMENS.NS", "INDHOTEL.NS",
+        "BANKBARODA.NS", "HINDPETRO.NS", "DABUR.NS", "GODREJCP.NS",
+    ],
     "MIDCAP150": [
-        "MUTHOOTFIN.NS",
-        "SRF.NS",
-        "TATAPOWER.NS",
-        "BANDHANBNK.NS",
-        "DIXON.NS",
-        "INDHOTEL.NS",
-        "PNB.NS",
-        "IDFCFIRSTB.NS",
-        "JKCEMENT.NS",
-        "MPHASIS.NS",
-        "LTI.NS",
-        "AUBANK.NS",
+        "DMART.NS", "PIDILITIND.NS", "DIVISLAB.NS", "LUPIN.NS",
+        "ABBOTINDIA.NS", "PAGEIND.NS", "POLYCAB.NS", "AUBANK.NS",
+        "TATACOMM.NS", "TATACONSUM.NS", "MUTHOOTFIN.NS",
+        "CHOLAFIN.NS", "INDHOTEL.NS", "TATAPOWER.NS", "DALBHARAT.NS",
+        "TRENT.NS", "BERGEPAINT.NS", "MFSL.NS", "NAUKRI.NS",
     ],
     "SMALLCAP100": [
-        "IEX.NS",
-        "PERSISTENT.NS",
-        "AFFLE.NS",
-        "AARTIIND.NS",
-        "DEEPAKNTR.NS",
-        "ALEMBICLTD.NS",
-        "AMBER.NS",
-        "GARFIBRES.NS",
-        "GUJGASLTD.NS",
-        "KEI.NS",
-        "NAVINFLUOR.NS",
-        "OFSS.NS",
-        "PIIND.NS",
+        "ZOMATO.NS", "NYKAA.NS", "MAPMYINDIA.NS", "DEEPAKNTR.NS",
+        "TATAELXSI.NS", "INDIAMART.NS", "PVRINOX.NS", "AARTIIND.NS",
+        "KEI.NS", "ASTERDM.NS", "SYNGENE.NS", "SRF.NS",
+        "JKCEMENT.NS", "NATCOPHARM.NS", "CERA.NS",
+    ],
+    # Locked custom high-quality list that you defined earlier (broader 20)
+    "CUSTOM_HQ20": [
+        "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS",
+        "INFY.NS", "TCS.NS", "ITC.NS", "HINDUNILVR.NS",
+        "ASIANPAINT.NS", "BAJFINANCE.NS",
+        "DMART.NS", "PIDILITIND.NS", "DIVISLAB.NS",
+        "SUNPHARMA.NS", "TITAN.NS", "ULTRACEMCO.NS",
+        "MARUTI.NS", "AXISBANK.NS", "LT.NS", "NESTLEIND.NS",
     ],
 }
 
-CUSTOM_HQ20_KEY = "CUSTOM_HQ20"
+RISK_LEVELS = ["Low", "Medium", "High", "All or Nothing"]
 
-UNIVERSES[CUSTOM_HQ20_KEY] = [
-    "RELIANCE.NS",
-    "HDFCBANK.NS",
-    "ICICIBANK.NS",
-    "KOTAKBANK.NS",
-    "AXISBANK.NS",
-    "SBIN.NS",
-    "TCS.NS",
-    "INFY.NS",
-    "HCLTECH.NS",
-    "HINDUNILVR.NS",
-    "ASIANPAINT.NS",
-    "NESTLEIND.NS",
-    "ITC.NS",
-    "SUNPHARMA.NS",
-    "DRREDDY.NS",
-    "ULTRACEMCO.NS",
-    "MARUTI.NS",
-    "BAJFINANCE.NS",
-    "TITAN.NS",
-    "POWERGRID.NS",
-]
+# Number of positions per risk level – this is what changes portfolio concentration
+RISK_TO_POSITIONS = {
+    "Low": 12,
+    "Medium": 8,
+    "High": 6,
+    "All or Nothing": 3,
+}
 
 
-def get_universe_symbols(key: str) -> List[str]:
-    if key == "NIFTY200":
-        # fallback so it still works:
-        return UNIVERSES["NIFTY100"]
-    return UNIVERSES.get(key, [])
+def _pick_symbols_for_risk(universe_symbols: List[str], risk_profile: str) -> List[str]:
+    """Pick a sub-list of symbols based on risk. Very simple heuristic."""
+    num_positions = RISK_TO_POSITIONS.get(risk_profile, 8)
+    num_positions = min(num_positions, len(universe_symbols))
+    # For now just take the first N symbols – later we can rank by volatility, etc.
+    return universe_symbols[:num_positions]
 
 
-def simple_equal_weight_portfolio(
-    symbols: List[str],
-    total_amount: float,
+def build_portfolio(
+    universe_key: str,
     risk_profile: str,
-) -> List[Dict]:
+    total_capital: float,
+) -> Tuple[pd.DataFrame, float]:
     """
-    Very simple allocation: equal-weight by amount, rounded to nearest share.
-    Does NOT call OpenAI.
+    Build a simple equal-weight portfolio within the chosen universe.
+
+    Returns (df, unallocated_cash)
+      df columns: Symbol, Approx Price, Allocation (%), Allocation (₹), Approx Qty
     """
-    if not symbols:
-        return []
+    if total_capital <= 0:
+        raise ValueError("Total capital must be positive.")
 
-    prices: Dict[str, float] = {}
-    for sym in symbols:
-        try:
-            df = fetch_history(sym, period="5d", interval="1d")
-            prices[sym] = float(df["Close"].iloc[-1])
-        except Exception:
-            # skip if price unavailable
-            continue
+    if universe_key not in UNIVERSES:
+        raise ValueError("Unknown universe selected.")
 
-    usable = list(prices.keys())
-    if not usable:
-        return []
+    all_symbols = UNIVERSES[universe_key]
+    selected = _pick_symbols_for_risk(all_symbols, risk_profile)
+    n = len(selected)
+    if n == 0:
+        raise ValueError("No symbols available for the selected universe.")
 
-    n_positions = len(usable)
-    per_stock_amount = total_amount / n_positions
+    equal_weight_pct = round(100.0 / n, 2)
 
     rows = []
-    cash_left = total_amount
+    unallocated_cash = total_capital
 
-    for sym in usable:
-        price = prices[sym]
-        qty = int(per_stock_amount // price)
-        alloc_value = qty * price
-        alloc_pct = (alloc_value / total_amount * 100) if total_amount > 0 else 0
-
-        cash_left -= alloc_value
+    for sym in selected:
+        price = get_latest_price(sym)
+        allocation_rupees = total_capital * equal_weight_pct / 100.0
+        qty = math.floor(allocation_rupees / price) if price > 0 else 0
+        used_cash = qty * price
+        unallocated_cash -= used_cash
 
         rows.append(
             {
-                "symbol": sym,
-                "price": round(price, 2),
-                "allocation_pct": round(alloc_pct, 2),
-                "allocation_value": round(alloc_value, 2),
-                "qty": qty,
+                "Symbol": sym,
+                "Approx Price (₹)": round(price, 2),
+                "Allocation (%)": equal_weight_pct,
+                "Allocation (₹)": round(used_cash, 2),
+                "Approx Qty": int(qty),
             }
         )
 
-    # We will return rows + a separate cash_left from Streamlit side.
-    # (Streamlit will compute / show the cash text.)
-    return rows
+    df = pd.DataFrame(rows)
+    unallocated_cash = round(unallocated_cash, 2)
+    return df, unallocated_cash
