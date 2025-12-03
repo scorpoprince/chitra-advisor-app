@@ -88,6 +88,7 @@ if not FMP_API_KEY:
     except Exception:
         FMP_API_KEY = ""
 
+print("[DEBUG] FMP key length:", len(FMP_API_KEY))  # will show up in Streamlit logs
 # symbol -> (timestamp, price)
 _PRICE_CACHE: Dict[str, Tuple[float, float]] = {}
 _PRICE_TTL_SEC = 300  # 5 minutes
@@ -172,6 +173,11 @@ def _download_history(symbol: str, period: str = "1y", interval: str = "1d") -> 
     raise RuntimeError(f"Could not download data for {symbol}: {last_err}")
 
 
+# symbol -> (timestamp, price)
+_PRICE_CACHE: Dict[str, Tuple[float, float]] = {}
+_PRICE_TTL_SEC = 300  # 5 minutes
+
+
 def _get_price_from_fmp(symbol: str) -> float:
     """
     Fetch latest price from Financial Modeling Prep.
@@ -181,6 +187,8 @@ def _get_price_from_fmp(symbol: str) -> float:
         raise RuntimeError("FMP_API_KEY is not set in environment or Streamlit secrets.")
 
     url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={FMP_API_KEY}"
+    print(f"[DEBUG] Calling FMP for {symbol}: {url}")  # 👈 debug
+
     resp = requests.get(url, timeout=5)
 
     if resp.status_code != 200:
@@ -206,6 +214,7 @@ def _get_price_from_yf(symbol: str) -> float:
     """
     Fallback price using yfinance (last close from 5 days).
     """
+    print(f"[DEBUG] Falling back to yfinance for {symbol}")
     df = _download_history(symbol, period="5d", interval="1d")
     latest_close = float(df["Close"].iloc[-1])
     return round(latest_close, 2)
