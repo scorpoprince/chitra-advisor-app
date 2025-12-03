@@ -2,7 +2,7 @@
 Core logic for ChitraAdvisor – Stock Helper
 
 - Handles symbol normalisation (".NS" auto-handling)
-- Fetches prices with caching + retry
+- Fetches prices with caching + retry (FMP primary, yfinance fallback)
 - Single–stock idea via OpenAI
 - Portfolio suggestion (universe + risk based)
 """
@@ -10,9 +10,11 @@ Core logic for ChitraAdvisor – Stock Helper
 import json
 import math
 import time
+import os
 from functools import lru_cache
 from typing import List, Dict, Tuple
 
+import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -74,6 +76,13 @@ def _safe_chat(
 # Very small in-memory cache for AI-resolved symbols
 _SYMBOL_RESOLUTION_CACHE: Dict[str, str] = {}
 
+# FMP config & simple price cache
+FMP_API_KEY = os.getenv("FMP_API_KEY", "").strip()
+
+# symbol -> (timestamp, price)
+_PRICE_CACHE: Dict[str, Tuple[float, float]] = {}
+_PRICE_TTL_SEC = 300  # 5 minutes
+
 
 def normalize_symbol(user_input: str) -> str:
     """
@@ -131,8 +140,8 @@ def _download_history(symbol: str, period: str = "1y", interval: str = "1d") -> 
     """
     Download price history with retry & small cache.
 
-    We purposely keep this independent from Streamlit,
-    so it also works in local CLI tests.
+    This is used as a fallback (yfinance) when FMP is unavailable,
+    and also for computing technicals.
     """
     last_err = None
     for attempt in range(3):
@@ -154,10 +163,72 @@ def _download_history(symbol: str, period: str = "1y", interval: str = "1d") -> 
     raise RuntimeError(f"Could not download data for {symbol}: {last_err}")
 
 
-def get_latest_price(symbol: str) -> float:
+def _get_price_from_fmp(symbol: str) -> float:
+    """
+    Fetch latest price from Financial Modeling Prep.
+    Raises if API key missing or response invalid.
+    """
+    if not FMP_API_KEY:
+        raise RuntimeError("FMP_API_KEY is not set in the environment.")
+
+    url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={FMP_API_KEY}"
+    resp = requests.get(url, timeout=5)
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"FMP HTTP {resp.status_code}: {resp.text[:200]}")
+
+    data = resp.json()
+    if not data or not isinstance(data, list):
+        raise RuntimeError(f"FMP returned empty/invalid data for {symbol}: {data}")
+
+    item = data[0]
+    price = item.get("price") or item.get("previousClose")
+    if price is None:
+        raise RuntimeError(f"FMP data missing price for {symbol}: {item}")
+
+    price = float(price)
+    if price <= 0:
+        raise RuntimeError(f"FMP returned non-positive price for {symbol}: {price}")
+
+    return round(price, 2)
+
+
+def _get_price_from_yf(symbol: str) -> float:
+    """
+    Fallback price using yfinance (last close from 5 days).
+    """
     df = _download_history(symbol, period="5d", interval="1d")
     latest_close = float(df["Close"].iloc[-1])
     return round(latest_close, 2)
+
+
+def get_latest_price(symbol: str) -> float:
+    """
+    Get latest price for a symbol.
+
+    Strategy:
+    1. If we have a recent cached price (<= 5 min), return it.
+    2. Try FMP first (cheap & reliable, up to 250 calls/day).
+    3. If FMP fails (quota/network/anything), fall back to yfinance.
+    """
+    now = time.time()
+
+    # 1) Cache hit
+    if symbol in _PRICE_CACHE:
+        ts, cached_price = _PRICE_CACHE[symbol]
+        if now - ts <= _PRICE_TTL_SEC:
+            return cached_price
+
+    # 2) Try FMP
+    try:
+        price = _get_price_from_fmp(symbol)
+    except Exception as exc:
+        print(f"[WARN] FMP price fetch failed for {symbol}: {exc}. Falling back to yfinance.")
+        # 3) Fallback to yfinance
+        price = _get_price_from_yf(symbol)
+
+    _PRICE_CACHE[symbol] = (now, price)
+    return price
 
 
 def get_basic_technicals(symbol: str) -> Dict:
