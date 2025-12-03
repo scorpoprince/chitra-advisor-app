@@ -185,26 +185,39 @@ def _download_history(symbol: str, period: str = "1y", interval: str = "1d") -> 
 
 def _get_price_from_fmp(symbol: str) -> float:
     """
-    Fetch latest price from Financial Modeling Prep.
+    Fetch latest price from Financial Modeling Prep using the new STABLE quote endpoint.
     Raises if API key missing or response invalid.
     """
     if not FMP_API_KEY:
         raise RuntimeError("FMP_API_KEY is not set in Streamlit secrets.")
 
-    url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={FMP_API_KEY}"
-    logger.info("Calling FMP for %s", symbol)
+    # New, non-legacy endpoint
+    url = f"https://financialmodelingprep.com/stable/quote?symbol={symbol}&apikey={FMP_API_KEY}"
+    logger.info("Calling FMP (stable quote) for %s", symbol)
 
     resp = requests.get(url, timeout=5)
+
+    # If FMP still complains about legacy / permission, surface that clearly
+    if resp.status_code == 403 and "Legacy Endpoint" in resp.text:
+        raise RuntimeError(
+            "FMP 403 Legacy Endpoint / permission error on stable quote endpoint. "
+            "Your current FMP plan may not include this dataset for this symbol."
+        )
 
     if resp.status_code != 200:
         raise RuntimeError(f"FMP HTTP {resp.status_code}: {resp.text[:200]}")
 
     data = resp.json()
-    if not data or not isinstance(data, list):
+
+    # Expected shape per docs is a list like: [ { "symbol": "...", "price": ... } ]
+    if isinstance(data, list) and data:
+        item = data[0]
+    elif isinstance(data, dict) and "symbol" in data:
+        item = data
+    else:
         raise RuntimeError(f"FMP returned empty/invalid data for {symbol}: {data}")
 
-    item = data[0]
-    price = item.get("price") or item.get("previousClose")
+    price = item.get("price") or item.get("previousClose") or item.get("close")
     if price is None:
         raise RuntimeError(f"FMP data missing price for {symbol}: {item}")
 
