@@ -18,11 +18,13 @@ import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import streamlit as st
 from openai import OpenAI
 
 # ============ OpenAI client & helpers ============
 
 client = OpenAI()
+
 
 def _safe_chat(
     system_prompt: str,
@@ -71,6 +73,7 @@ def _safe_chat(
 
     raise RuntimeError(f"OpenAI call failed: {last_err}")
 
+
 # ============ Symbol helpers & price cache ============
 
 # Very small in-memory cache for AI-resolved symbols
@@ -78,6 +81,12 @@ _SYMBOL_RESOLUTION_CACHE: Dict[str, str] = {}
 
 # FMP config & simple price cache
 FMP_API_KEY = os.getenv("FMP_API_KEY", "").strip()
+if not FMP_API_KEY:
+    # Fallback to Streamlit secrets if env var is not set
+    try:
+        FMP_API_KEY = str(st.secrets.get("FMP_API_KEY", "")).strip()
+    except Exception:
+        FMP_API_KEY = ""
 
 # symbol -> (timestamp, price)
 _PRICE_CACHE: Dict[str, Tuple[float, float]] = {}
@@ -169,7 +178,7 @@ def _get_price_from_fmp(symbol: str) -> float:
     Raises if API key missing or response invalid.
     """
     if not FMP_API_KEY:
-        raise RuntimeError("FMP_API_KEY is not set in the environment.")
+        raise RuntimeError("FMP_API_KEY is not set in environment or Streamlit secrets.")
 
     url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={FMP_API_KEY}"
     resp = requests.get(url, timeout=5)
@@ -492,6 +501,11 @@ def build_portfolio(
 
     Returns (df, unallocated_cash)
       df columns: Symbol, Approx Price, Allocation (%), Allocation (₹), Approx Qty
+
+    Robust version:
+    - Tries to fetch price for each symbol.
+    - Skips symbols whose price fetch fails.
+    - Rebalances weights over the remaining symbols.
     """
     if total_capital <= 0:
         raise ValueError("Total capital must be positive.")
@@ -501,17 +515,36 @@ def build_portfolio(
 
     all_symbols = UNIVERSES[universe_key]
     selected = _pick_symbols_for_risk(all_symbols, risk_profile)
-    n = len(selected)
-    if n == 0:
+
+    if not selected:
         raise ValueError("No symbols available for the selected universe.")
 
+    price_map: Dict[str, float] = {}
+    skipped_symbols: List[str] = []
+
+    # 1) Try to fetch prices; skip failures
+    for sym in selected:
+        try:
+            price_map[sym] = get_latest_price(sym)
+        except Exception as exc:
+            skipped_symbols.append(sym)
+            print(f"[WARN] Skipping {sym} – price fetch failed: {exc}")
+
+    if not price_map:
+        # Everything failed – bail out cleanly
+        raise RuntimeError(
+            "Could not fetch price data for any stocks in this universe. "
+            "Please try again later or choose a different universe."
+        )
+
+    n = len(price_map)
     equal_weight_pct = round(100.0 / n, 2)
 
     rows = []
     unallocated_cash = total_capital
 
-    for sym in selected:
-        price = get_latest_price(sym)
+    # 2) Build rows only for successful symbols
+    for sym, price in price_map.items():
         allocation_rupees = total_capital * equal_weight_pct / 100.0
         qty = math.floor(allocation_rupees / price) if price > 0 else 0
         used_cash = qty * price
@@ -529,4 +562,8 @@ def build_portfolio(
 
     df = pd.DataFrame(rows)
     unallocated_cash = round(unallocated_cash, 2)
+
+    if skipped_symbols:
+        print(f"[INFO] Portfolio built, but skipped symbols: {', '.join(skipped_symbols)}")
+
     return df, unallocated_cash
