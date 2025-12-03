@@ -25,6 +25,14 @@ from openai import OpenAI
 
 client = OpenAI()
 
+# ==== FMP API key – force from Streamlit secrets ====
+try:
+    FMP_API_KEY = st.secrets["FMP_API_KEY"].strip()
+except Exception:
+    FMP_API_KEY = ""
+
+print("[DEBUG] FMP key present:", bool(FMP_API_KEY))
+# ====================================================
 
 def _safe_chat(
     system_prompt: str,
@@ -80,13 +88,13 @@ def _safe_chat(
 _SYMBOL_RESOLUTION_CACHE: Dict[str, str] = {}
 
 # FMP config & simple price cache
-FMP_API_KEY = os.getenv("FMP_API_KEY", "").strip()
-if not FMP_API_KEY:
+#FMP_API_KEY = os.getenv("FMP_API_KEY", "").strip()
+#if not FMP_API_KEY:
     # Fallback to Streamlit secrets if env var is not set
-    try:
-        FMP_API_KEY = str(st.secrets.get("FMP_API_KEY", "")).strip()
-    except Exception:
-        FMP_API_KEY = ""
+ #   try:
+  #      FMP_API_KEY = str(st.secrets.get("FMP_API_KEY", "")).strip()
+   # except Exception:
+    #    FMP_API_KEY = ""
 
 print("[DEBUG] FMP key length:", len(FMP_API_KEY))  # will show up in Streamlit logs
 # symbol -> (timestamp, price)
@@ -184,10 +192,10 @@ def _get_price_from_fmp(symbol: str) -> float:
     Raises if API key missing or response invalid.
     """
     if not FMP_API_KEY:
-        raise RuntimeError("FMP_API_KEY is not set in environment or Streamlit secrets.")
+        raise RuntimeError("FMP_API_KEY is not set in Streamlit secrets.")
 
     url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={FMP_API_KEY}"
-    print(f"[DEBUG] Calling FMP for {symbol}: {url}")  # 👈 debug
+    print(f"[DEBUG] Calling FMP for {symbol}")  # <-- will show in logs
 
     resp = requests.get(url, timeout=5)
 
@@ -224,29 +232,28 @@ def get_latest_price(symbol: str) -> float:
     """
     Get latest price for a symbol.
 
-    Strategy:
-    1. If we have a recent cached price (<= 5 min), return it.
-    2. Try FMP first (cheap & reliable, up to 250 calls/day).
-    3. If FMP fails (quota/network/anything), fall back to yfinance.
+    1. Use 5-minute cache if available.
+    2. Try FMP first.
+    3. On ANY error, fall back to yfinance.
     """
     now = time.time()
 
-    # 1) Cache hit
+    # cache
     if symbol in _PRICE_CACHE:
         ts, cached_price = _PRICE_CACHE[symbol]
         if now - ts <= _PRICE_TTL_SEC:
             return cached_price
 
-    # 2) Try FMP
+    # FMP first
     try:
         price = _get_price_from_fmp(symbol)
     except Exception as exc:
-        print(f"[WARN] FMP price fetch failed for {symbol}: {exc}. Falling back to yfinance.")
-        # 3) Fallback to yfinance
+        print(f"[WARN] FMP price fetch failed for {symbol}: {exc}")
         price = _get_price_from_yf(symbol)
 
     _PRICE_CACHE[symbol] = (now, price)
     return price
+
 
 
 def get_basic_technicals(symbol: str) -> Dict:
