@@ -29,8 +29,21 @@ def _safe_chat(
     max_tokens: int = 900,
     temperature: float = 0.4,
 ) -> str:
-    """Small wrapper with basic retry & friendly errors."""
+    """
+    Wrapper around OpenAI Chat API with automatic handling of
+    model-specific token parameters.
+
+    Newer models (gpt-5.x / o-series) DO NOT accept `max_tokens`.
+    They require `max_completion_tokens`.
+    """
     last_err = None
+
+    # Decide parameter name based on model
+    if model.startswith("gpt-5") or model.startswith("o"):
+        token_param = {"max_completion_tokens": max_tokens}
+    else:
+        token_param = {"max_tokens": max_tokens}
+
     for attempt in range(3):
         try:
             resp = client.chat.completions.create(
@@ -40,18 +53,20 @@ def _safe_chat(
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=temperature,
-                max_tokens=max_tokens,
+                **token_param,
             )
             return resp.choices[0].message.content.strip()
-        except Exception as exc:  # broad, we don't want the app to crash
+        except Exception as exc:
             last_err = exc
             msg = str(exc).lower()
-            # crude rate-limit / transient error detection
+
+            # retry for transient errors
             if "rate" in msg or "timeout" in msg or "overloaded" in msg:
-                sleep_for = 2 ** attempt
-                time.sleep(sleep_for)
+                time.sleep(2 ** attempt)
                 continue
-            break
+
+            break  # non-retryable
+
     raise RuntimeError(f"OpenAI call failed: {last_err}")
 
 # ============ Symbol helpers & price cache ============
