@@ -1,22 +1,13 @@
-"""
-Streamlit front-end for ChitraAdvisor – Stock Helper (Safety ON)
-
-This UI uses the refactored `backend` package for all core logic.  The
-OpenAI API key must still be provided via Streamlit secrets under the
-`OPENAI_API_KEY` key.
-"""
-
 import os
-
 import streamlit as st
 
-# Import the refactored backend modules.  The functions and constants live
-# under the `backend` package instead of the monolithic chitra_core.py.
+# NEW: import the custom fine-tuned model config
+from config import FINE_TUNED_MODEL
+
 from backend.single_stock import analyze_single_stock
 from backend.portfolio import build_portfolio
 from backend.models import UNIVERSES, RISK_LEVELS, RISK_TO_POSITIONS
 
-# Bridge Streamlit secrets -> environment for OpenAI client
 if "OPENAI_API_KEY" in st.secrets:
     os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 
@@ -43,16 +34,11 @@ with tab_single:
     with col_left:
         user_symbol = st.text_input(
             "Company name or NSE symbol",
-            help="Examples: `TCS`, `RELIANCE`, `MARUTI.NS`. "
-                 "You can also try a full name like `Maruti Suzuki India Limited`.",
+            help="Examples: `TCS`, `RELIANCE`, `MARUTI.NS`. You can also try a full name like `Maruti Suzuki India Limited`.",
         )
 
         holding_period_days = st.slider(
-            "Intended holding period (days)",
-            min_value=30,
-            max_value=730,
-            value=90,
-            step=10,
+            "Intended holding period (days)", min_value=30, max_value=730, value=90, step=10
         )
 
         language_choice = st.radio(
@@ -85,11 +71,13 @@ with tab_single:
             ),
         )
 
-        model_choice = st.selectbox(
-            "AI model",
-            options=["gpt-5.1", "gpt-4.1-mini"],
-            index=0,
-        )
+        model_option = st.selectbox("Choose model:", ["GPT-5.1", "GPT-4.0 Mini", "Custom Model"], index=0)
+        if model_option == "Custom Model":
+            model_name = FINE_TUNED_MODEL
+        elif model_option == "GPT-4.0 Mini":
+            model_name = "gpt-4o"
+        else:
+            model_name = "gpt-4"
 
     if st.button("Generate Stock View", type="primary"):
         try:
@@ -100,7 +88,7 @@ with tab_single:
                     risk_profile=risk_profile,
                     holding_period_days=holding_period_days,
                     language=language_code,
-                    model=model_choice,
+                    model=model_name,
                 )
 
             st.success(
@@ -108,7 +96,6 @@ with tab_single:
                 f"(approx last close ₹{result['metrics']['last_close']})"
             )
 
-            # Show quick metrics
             with st.expander("Quick technical snapshot", expanded=False):
                 m = result["metrics"]
                 cols = st.columns(3)
@@ -133,7 +120,7 @@ with tab_single:
     )
 
 # --------------------------------------------------------------------
-# Portfolio Suggestion tab
+# Portfolio Suggestion tab (unchanged)
 # --------------------------------------------------------------------
 with tab_portfolio:
     st.subheader("Portfolio Suggestion (Universe-based)")
@@ -141,27 +128,17 @@ with tab_portfolio:
     col_left, col_right = st.columns([2, 2])
 
     with col_left:
-        universe_type = st.radio(
-            "Universe type",
-            options=["Index / Custom"],  # Sector mode can come later
-            horizontal=True,
-        )
+        universe_type = st.radio("Universe type", options=["Index / Custom"], horizontal=True)
 
         universe_key_ui = st.selectbox(
             "Choose universe",
             options=[
-                "NIFTY50",
-                "NIFTY100",
-                "NIFTY Next 50",
-                "NIFTY200",
-                "Midcap 150",
-                "Smallcap 100",
-                "Custom High-Quality 20",
+                "NIFTY50", "NIFTY100", "NIFTY Next 50", "NIFTY200",
+                "Midcap 150", "Smallcap 100", "Custom High-Quality 20",
             ],
             index=0,
         )
 
-        # Map UI label to internal key
         universe_map = {
             "NIFTY50": "NIFTY50",
             "NIFTY100": "NIFTY100",
@@ -184,9 +161,7 @@ with tab_portfolio:
         )
 
         risk_profile_pf = st.selectbox(
-            "Risk profile for this portfolio",
-            options=RISK_LEVELS,
-            index=1,
+            "Risk profile for this portfolio", options=RISK_LEVELS, index=1
         )
 
         risk_help_map = {
@@ -212,15 +187,10 @@ with tab_portfolio:
                 f"· **Positions:** {len(df)}"
             )
 
-            st.dataframe(
-                df,
-                use_container_width=True,
-                hide_index=True,
-            )
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
             st.info(
-                f"Approx cash left unallocated due to lot sizes: "
-                f"₹{unallocated_cash:,.2f}"
+                f"Approx cash left unallocated due to lot sizes: ₹{unallocated_cash:,.2f}"
             )
 
         except Exception as exc:
